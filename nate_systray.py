@@ -4,48 +4,48 @@ import signal
 import psutil
 import subprocess
 import gi
-import re
+import time
 from datetime import datetime
 
-# Force GTK 3 because AppIndicator3 requires it
+# Force GTK 3
 gi.require_version('Gtk', '3.0')
 gi.require_version('AyatanaAppIndicator3', '0.1')
-
 from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator
 
 APP_ID = "nate-sys-tray"
+DASH_PATH = os.path.expanduser("~/Desktop/DASHBOARD.html")
 
 class NateSysTray:
     def __init__(self):
         self.indicator = AppIndicator.Indicator.new(
-            APP_ID,
-            "drive-harddisk-symbolic",
-            AppIndicator.IndicatorCategory.SYSTEM_SERVICES
+            APP_ID, "drive-harddisk-symbolic", AppIndicator.IndicatorCategory.SYSTEM_SERVICES
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         
         self.menu = Gtk.Menu()
         
-        # Static top items
-        self.item_cpu = Gtk.MenuItem(label="CPU: Scanning...")
-        self.item_ram = Gtk.MenuItem(label="RAM: Scanning...")
+        # --- BRAIN: CPU & RAM ---
+        self.item_cpu = Gtk.MenuItem(label="CPU: --%")
+        self.item_ram = Gtk.MenuItem(label="RAM: --%")
         self.menu.append(self.item_cpu)
         self.menu.append(self.item_ram)
-        self.menu.append(Gtk.SeparatorMenuItem())
         
-        # Categories for dynamic updates
-        self.gpu_items = {}
-        self.disk_items = {}
+        # --- MUSCLE: GPUs ---
+        self.sep_gpu = Gtk.SeparatorMenuItem()
+        self.menu.append(self.sep_gpu)
+        self.gpu_items = {} # Dict of {name: (menu_item)}
+
+        # --- MEMORY: DISKS ---
+        self.sep_disk = Gtk.SeparatorMenuItem()
+        self.menu.append(self.sep_disk)
+        self.disk_items = {} # Dict of {name: (menu_item)}
         
-        # Position trackers
-        self.disk_start_index = 3 # After CPU, RAM, Separator
-        
+        # --- FOOTER ---
         self.menu.append(Gtk.SeparatorMenuItem())
         item_dash = Gtk.MenuItem(label="Open Mission Control (Web)")
         item_dash.connect("activate", self.open_dashboard)
         self.menu.append(item_dash)
 
-        self.menu.append(Gtk.SeparatorMenuItem())
         item_quit = Gtk.MenuItem(label="Exit Monitor")
         item_quit.connect("activate", Gtk.main_quit)
         self.menu.append(item_quit)
@@ -53,99 +53,183 @@ class NateSysTray:
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
         
+        self.last_io_time = time.time()
+        self.last_io_counters = psutil.disk_io_counters(perdisk=True)
+
         self.update_data()
-        GLib.timeout_add_seconds(3, self.update_data)
+        GLib.timeout_add_seconds(2, self.update_data)
+
+    def draw_bar(self, label, pct, width=15):
+        """Creates a sick ASCII bar: [████   50%   ░░░]"""
+        pct = int(float(pct))
+        filled = int((pct / 100) * width)
+        bar = "█" * filled + "░" * (width - filled)
+        
+        # Calculate text centering
+        text = f"{pct}%"
+        # Overlay the percentage text onto the bar? Hard to do with mono spacing in menus
+        # We'll do a clean version: Label [████░░░] 50%
+        return f"{label:<8} |{bar}| {pct:>3}%"
 
     def get_gpus(self):
         gpus = []
-        # Support NVIDIA
         try:
             nv_out = subprocess.check_output([
-                "nvidia-smi", "--query-gpu=name,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"
+                "nvidia-smi", "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"
             ]).decode().strip()
             for line in nv_out.split('\n'):
                 if line.strip():
-                    name, use, temp = line.split(',')
-                    gpus.append({"name": f"NV: {name.strip()}", "stats": f"{use.strip()}% @ {temp.strip()}C"})
+                    name, use, temp, v_used, v_total = line.split(',')
+                    gpus.append({"name": "NV", "model": name.strip(), "load": use.strip(), "temp": temp.strip(), "v_used": v_used.strip(), "v_total": v_total.strip()})
         except: pass
-
-        # Support AMD/Intel via sysfs
         try:
             for i in range(128, 135):
                 path = f"/sys/class/drm/renderD{i}/device"
-                if os.path.exists(f"{path}/vendor"):
-                    with open(f"{path}/vendor", 'r') as f: vendor = f.read().strip()
-                    if vendor == "0x1002" and os.path.exists(f"{path}/gpu_busy_percent"):
-                        with open(f"{path}/gpu_busy_percent", 'r') as f: use = f.read().strip()
-                        gpus.append({"name": f"AMD GPU (D{i})", "stats": f"{use}%"})
-                    elif vendor == "0x8086":
-                        gpus.append({"name": f"Intel GPU (D{i})", "stats": "Detected"})
+                if os.path.exists(f"{path}/gpu_busy_percent"):
+                    with open(f"{path}/gpu_busy_percent", 'r') as f: use = f.read().strip()
+                    v_used_p = f"{path.replace('renderD', 'card')}/device/mem_info_vram_used"
+                    v_total_p = f"{path.replace('renderD', 'card')}/device/mem_info_vram_total"
+                    v_used, v_total = "0", "0"
+                    if os.path.exists(v_used_p):
+                        with open(v_used_p, 'r') as f: v_used = str(int(f.read().strip()) // (1024**2))
+                        with open(v_total_p, 'r') as f: v_total = str(int(f.read().strip()) // (1024**2))
+                    gpus.append({"name": "AMD", "model": "Radeon 780M", "load": use, "temp": "N/A", "v_used": v_used, "v_total": v_total})
         except: pass
         return gpus
 
-    def get_disks(self):
-        disks = []
-        # Capture Root and any mounts under /mnt or /media (like your NAS)
-        for part in psutil.disk_partitions(all=False):
-            if part.mountpoint == '/' or part.mountpoint.startswith(('/mnt', '/media')):
-                try:
-                    usage = psutil.disk_usage(part.mountpoint)
-                    name = "OS (SSD)" if part.mountpoint == "/" else part.mountpoint.split('/')[-1]
-                    disks.append({
-                        "name": name,
-                        "stats": f"{usage.percent}% ({usage.free // (1024**3)}GB Free)"
-                    })
-                except: pass
-        return disks
+    def get_io_rates(self):
+        now = time.time()
+        dt = max(now - self.last_io_time, 0.1)
+        rates = {}
+        try:
+            counters = psutil.disk_io_counters(perdisk=True)
+            for d, cur in counters.items():
+                if d in self.last_io_counters:
+                    last = self.last_io_counters[d]
+                    rates[d] = ((cur.read_bytes - last.read_bytes)/dt/(1024**2), (cur.write_bytes - last.write_bytes)/dt/(1024**2))
+            self.last_io_counters = counters
+            self.last_io_time = now
+        except: pass
+        return rates
 
     def update_data(self):
         try:
-            cpu_pct = psutil.cpu_percent()
+            cpu = psutil.cpu_percent()
             ram = psutil.virtual_memory()
-            
-            # 1. Update Disks
-            disks = self.get_disks()
-            for i, disk in enumerate(disks):
-                name = f"Disk: {disk['name']}"
-                if name not in self.disk_items:
-                    new_item = Gtk.MenuItem(label=f"{name}: {disk['stats']}")
-                    self.menu.insert(new_item, self.disk_start_index + i)
-                    self.disk_items[name] = new_item
-                    new_item.show()
-                else:
-                    self.disk_items[name].set_label(f"{name}: {disk['stats']}")
-
-            # 2. Update GPUs
+            io = self.get_io_rates()
             gpus = self.get_gpus()
-            gpu_offset = self.disk_start_index + len(self.disk_items)
-            for i, gpu in enumerate(gpus):
-                name = gpu['name']
-                if name not in self.gpu_items:
-                    new_item = Gtk.MenuItem(label=f"{name}: {gpu['stats']}")
-                    self.menu.insert(new_item, gpu_offset + i)
-                    self.gpu_items[name] = new_item
-                    new_item.show()
-                else:
-                    self.gpu_items[name].set_label(f"{name}: {gpu['stats']}")
-
-            # 3. Static Stats
-            self.item_cpu.set_label(f"CPU Load: {cpu_pct}%")
-            self.item_ram.set_label(f"Memory: {ram.percent}% ({ram.available // (1024**2)}MB Avail)")
-
-            # 4. Tray Summary (Root Disk % | Primary GPU %)
-            root_usage = psutil.disk_usage('/').percent
-            gpu_usage = gpus[0]['stats'].split(' ')[0] if gpus else "N/A"
-            self.indicator.set_label(f" D:{root_usage}% | G:{gpu_usage}", "nate-sys-label")
             
+            # --- UPDATE TRAY LABELS (THE BARS) ---
+            self.item_cpu.set_label(self.draw_bar("CPU", cpu))
+            self.item_ram.set_label(self.draw_bar("RAM", ram.percent))
+            
+            # Update GPUs (After RAM, After Separator)
+            gpu_index = 3
+            for g in gpus:
+                label = f"GPU: {g['model']}"
+                bar_text = self.draw_bar(g['name'], g['load'])
+                if label not in self.gpu_items:
+                    item = Gtk.MenuItem(label=bar_text)
+                    self.menu.insert(item, gpu_index)
+                    self.gpu_items[label] = item
+                    item.show()
+                else:
+                    self.gpu_items[label].set_label(bar_text)
+                gpu_index += 1
+
+            # Update Disks (After GPUs, After Separator)
+            disk_index = gpu_index + 1
+            for part in psutil.disk_partitions(all=False):
+                if part.mountpoint == '/' or part.mountpoint.startswith(('/mnt', '/media')):
+                    usage = psutil.disk_usage(part.mountpoint)
+                    name = "OS_SSD" if part.mountpoint == "/" else part.mountpoint.split('/')[-1]
+                    dev = part.device.split('/')[-1]
+                    r, w = io.get(dev, (0.0, 0.0))
+                    label = f"Disk: {name}"
+                    bar_text = self.draw_bar(name[:8], usage.percent)
+                    if label not in self.disk_items:
+                        item = Gtk.MenuItem(label=bar_text)
+                        self.menu.insert(item, disk_index)
+                        self.disk_items[label] = item
+                        item.show()
+                    else:
+                        self.disk_items[label].set_label(bar_text)
+                    disk_index += 1
+
+            # Tray Summary
+            util = gpus[0]['load'] if gpus else "0"
+            self.indicator.set_label(f" C:{cpu}% R:{ram.percent}% G:{util}%", "nate-sys-label")
+            
+            # SYNC WEB DASHBOARD (Locked-in logic)
+            self.sync_dashboard(cpu, ram, gpus, io)
         except Exception as e:
             print(f"Update error: {e}")
         return True
 
-    def open_dashboard(self, _):
-        # We can also make this dynamic if DASHBOARD.html moves
-        dash_path = os.path.expanduser("~/Desktop/DASHBOARD.html")
-        if os.path.exists(dash_path):
-            subprocess.Popen(["xdg-open", dash_path])
+    def sync_dashboard(self, cpu, ram, gpus, io):
+        if not os.path.exists(DASH_PATH): return
+        with open(DASH_PATH, 'r') as f: lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            if 'id="cpu-val"' in line: line = f'                        <span id="cpu-val">{cpu}%</span>\n'
+            elif 'id="cpu-bar"' in line: line = f'                    <div id="cpu-bar" class="bar-fill" style="width: {cpu}%"></div>\n'
+            elif 'id="ram-val"' in line: line = f'                        <span id="ram-val">{ram.percent}%</span>\n'
+            elif 'id="ram-details"' in line: line = f'                        <span id="ram-details">{ram.used//(1024**3)}/{ram.total//(1024**3)} GB</span>\n'
+            elif 'id="ram-bar"' in line: line = f'                    <div id="ram-bar" class="bar-fill" style="width: {ram.percent}%; background: #a855f7;"></div>\n'
+            elif 'id="nv-load"' in line and gpus:
+                nv = [g for g in gpus if g['name'] == "NV"][0]
+                line = f'                        <span id="nv-load">{nv["load"]}%</span>\n'
+            elif 'id="nv-temp"' in line and gpus:
+                nv = [g for g in gpus if g['name'] == "NV"][0]
+                line = f'                        <span id="nv-temp">{nv["temp"]}C</span>\n'
+            elif 'id="nv-bar"' in line and gpus:
+                nv = [g for g in gpus if g['name'] == "NV"][0]
+                line = f'                    <div id="nv-bar" class="bar-fill" style="width: {nv["load"]}%; background: #76b900;"></div>\n'
+            elif 'id="nv-vram"' in line and gpus:
+                nv = [g for g in gpus if g['name'] == "NV"][0]
+                line = f'                        <span id="nv-vram">{nv["v_used"]} / {nv["v_total"]} MB</span>\n'
+            elif 'id="nv-vram-bar"' in line and gpus:
+                nv = [g for g in gpus if g['name'] == "NV"][0]
+                v_pct = (int(nv["v_used"])/int(nv["v_total"]))*100 if int(nv["v_total"]) > 0 else 0
+                line = f'                    <div id="nv-vram-bar" class="bar-fill" style="width: {v_pct}%; background: #4ade80;"></div>\n'
+            elif 'id="amd-load"' in line and len(gpus) > 1:
+                amd = [g for g in gpus if g['name'] == "AMD"][0]
+                line = f'                        <span id="amd-load">{amd["load"]}%</span>\n'
+            elif 'id="amd-bar"' in line and len(gpus) > 1:
+                amd = [g for g in gpus if g['name'] == "AMD"][0]
+                line = f'                    <div id="amd-bar" class="bar-fill" style="width: {amd["load"]}%; background: #ed1c24;"></div>\n'
+            elif 'id="amd-vram"' in line and len(gpus) > 1:
+                amd = [g for g in gpus if g['name'] == "AMD"][0]
+                line = f'                        <span id="amd-vram">{amd["v_used"]} / {amd["v_total"]} MB</span>\n'
+            elif 'id="amd-vram-bar"' in line and len(gpus) > 1:
+                amd = [g for g in gpus if g['name'] == "AMD"][0]
+                v_pct = (int(amd["v_used"])/int(amd["v_total"]))*100 if int(amd["v_total"]) > 0 else 0
+                line = f'                    <div id="amd-vram-bar" class="bar-fill" style="width: {v_pct}%; background: #f87171;"></div>\n'
+            elif 'id="ssd-space"' in line:
+                usage = psutil.disk_usage('/')
+                line = f'                        <span id="ssd-space">{usage.free//(1024**3)}G Free</span>\n'
+            elif 'id="ssd-bar"' in line:
+                usage = psutil.disk_usage('/')
+                line = f'                    <div id="ssd-bar" class="bar-fill" style="width: {usage.percent}%; background: #38bdf8;"></div>\n'
+            elif 'id="ssd-io"' in line:
+                dev = [p.device.split('/')[-1] for p in psutil.disk_partitions() if p.mountpoint == '/'][0]
+                r, w = io.get(dev, (0.0, 0.0))
+                line = f'            <div class="io-tag" id="ssd-io">R: {r:.1f} MB/s | W: {w:.1f} MB/s</div>\n'
+            elif 'id="nas-space"' in line and os.path.exists('/mnt/nas_media'):
+                usage = psutil.disk_usage('/mnt/nas_media')
+                line = f'                        <span id="nas-space">{usage.free//(1024**4)}T Free</span>\n'
+            elif 'id="nas-bar"' in line and os.path.exists('/mnt/nas_media'):
+                usage = psutil.disk_usage('/mnt/nas_media')
+                line = f'                    <div id="nas-bar" class="bar-fill" style="width: {usage.percent}%; background: #a855f7;"></div>\n'
+            elif 'id="nas-io"' in line and os.path.exists('/mnt/nas_media'):
+                devs = [p.device.split('/')[-1] for p in psutil.disk_partitions() if p.mountpoint == '/mnt/nas_media']
+                if devs:
+                    r, w = io.get(devs[0], (0.0, 0.0))
+                    line = f'            <div class="io-tag" id="nas-io">R: {r:.1f} MB/s | W: {w:.1f} MB/s</div>\n'
+            new_lines.append(line)
+        with open(DASH_PATH, 'w') as f: f.writelines(new_lines)
+
+    def open_dashboard(self, _): subprocess.Popen(["xdg-open", DASH_PATH])
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
